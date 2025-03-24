@@ -128,7 +128,6 @@ def process_conversation_history(conversation_history):
             processed_history.append({"role": role, "content": content})
     return processed_history
 
-
 def generate_and_store_assistant_message(
     chat, message, base_prompt_path, search_prompt_path
 ):
@@ -152,15 +151,6 @@ def generate_and_store_assistant_message(
     conversation_history = chat.get_conversation_history()
     processed_history = process_conversation_history(conversation_history)
     
-    # Start asynchronous processing
-    processing_state = llm_processing.start_processing_thread(
-        chat_id=chat.id,
-        conversation_history=processed_history,
-        enable_search=True,
-        evaluate_response=True,
-        regenerate_response=True
-    )
-    
     # Create a placeholder assistant message that will be updated when processing completes
     store_assistant_message(
         message_id=message.id,
@@ -169,11 +159,63 @@ def generate_and_store_assistant_message(
         output_number=1
     )
     
-    # Start a background thread to periodically check the processing state and update the message
+    # Get the Flask app for passing to the background thread
+    from flask import current_app
+    app = current_app._get_current_object()
+    
+    # Start a background thread to handle processing
+    # Pass the app object to the thread
     threading.Thread(
-        target=monitor_processing_state,
-        args=(chat.id, message.id, 1)
+        target=process_assistant_message,
+        args=(app, chat.id, message.id, 1, processed_history)
     ).start()
+
+
+def process_assistant_message(app, chat_id, message_id, output_number, conversation_history):
+    """
+    Process an assistant message in a background thread with proper app context.
+    
+    This function runs in a separate thread and handles the entire processing pipeline
+    for generating an assistant response, including:
+    - Starting the processing thread
+    - Monitoring the processing state
+    - Updating the message when processing completes
+    
+    Parameters:
+        app: The Flask application object
+        chat_id: The ID of the chat being processed
+        message_id: The ID of the message to update
+        output_number: The output number (1 for primary, 2 for secondary)
+        conversation_history: The processed conversation history
+    """
+    # Use the app context for all operations
+    with app.app_context():
+        try:
+            # Start asynchronous processing
+            llm_processing.start_processing_thread(
+                chat_id=chat_id,
+                conversation_history=conversation_history,
+                enable_search=True,
+                evaluate_response=True,
+                regenerate_response=True
+            )
+            
+            # Monitor the processing state directly here
+            monitor_processing_state_with_context(chat_id, message_id, output_number)
+        except Exception as e:
+            print(f"[ERROR] Error in process_assistant_message: {e}")
+            # Try to update message with error
+            try:
+                assistant_msg = AssistantMessage.query.filter_by(
+                    message_id=message_id, 
+                    output_number=output_number
+                ).first()
+                
+                if assistant_msg:
+                    assistant_msg.content = f"[Error processing message: {str(e)}]"
+                    db.session.commit()
+            except Exception as inner_e:
+                print(f"[ERROR] Failed to update error message: {inner_e}")
 
 
 def maybe_generate_second_assistant_message(
@@ -195,15 +237,6 @@ def maybe_generate_second_assistant_message(
     conversation_history = chat.get_conversation_history()
     processed_history = process_conversation_history(conversation_history)
     
-    # Start asynchronous processing with a different seed
-    processing_state = llm_processing.start_processing_thread(
-        chat_id=f"{chat.id}_second",  # Different chat_id for the second assistant
-        conversation_history=processed_history,
-        enable_search=True,
-        evaluate_response=True,
-        regenerate_response=True
-    )
-    
     # Create a placeholder assistant message that will be updated when processing completes
     store_assistant_message(
         message_id=message.id,
@@ -212,12 +245,159 @@ def maybe_generate_second_assistant_message(
         output_number=2
     )
     
-    # Start a background thread to periodically check the processing state and update the message
+    # Get the Flask app for passing to the background thread
+    from flask import current_app
+    app = current_app._get_current_object()
+    
+    # Start a background thread to handle processing
+    # Pass the app object to the thread
     threading.Thread(
-        target=monitor_processing_state,
-        args=(f"{chat.id}_second", message.id, 2)
+        target=process_assistant_message,
+        args=(app, f"{chat.id}_second", message.id, 2, processed_history)
     ).start()
 
+
+def monitor_processing_state_with_context(chat_id, message_id, output_number, check_interval=1, max_retries=300):
+    """
+    Monitor the processing state and update the message when processing completes.
+    This version runs within an app context already.
+    
+    Parameters:
+        chat_id: The ID of the chat being processed.
+        message_id: The ID of the message to update.
+        output_number: The output number (1 for primary, 2 for secondary).
+        check_interval: How often to check the processing state (in seconds).
+        max_retries: Maximum number of retries before giving up.
+    """
+    retries = 0
+    
+    # Function to update the assistant message based on the current state
+    def update_message_from_state():
+        # Get the current message
+        assistant_msg = AssistantMessage.query.filter_by(
+            message_id=message_id, 
+            output_number=output_number
+        ).first()
+        
+        if not assistant_msg:
+            print(f"[ERROR] Assistant message not found: {message_id}, output_number: {output_number}")
+            return
+            
+        # Update with message
+        state = llm_processing.get_processing_state(chat_id)
+        if not state:
+            assistant_msg.content = "[Processing state not found]"
+            db.session.commit()
+            return
+            
+        if state["completed"] or state["status"] == "error":
+            # Final update
+            if state["status"] == "error" or state["error"]:
+                error_msg = state["error"] or "Unknown error"
+                assistant_msg.content = f"[Error: {error_msg}]"
+            elif state["final_response"]:
+                assistant_msg.content = state["final_response"]
+                
+                # Update thinking
+                if state.get("assistant_response") and state["assistant_response"].get("thinking"):
+                    assistant_msg.thinking = state["assistant_response"]["thinking"]
+                    
+                # Update search output
+                if state.get("search_result"):
+                    assistant_msg.search_output = json.dumps(state["search_result"])
+                    
+                # Update critic score
+                if state.get("critic_result"):
+                    assistant_msg.critic_score = json.dumps(state["critic_result"])
+                    
+                # Update regenerated content if available
+                if state.get("regenerated_response"):
+                    assistant_msg.regenerated_content = state["regenerated_response"]
+                    
+                # Update regenerated critic if available
+                if state.get("regenerated_critic"):
+                    assistant_msg.regenerated_critic = json.dumps(state["regenerated_critic"])
+            else:
+                assistant_msg.content = "[No response generated]"
+        else:
+            # Progress update
+            step = state.get("step", "processing")
+            progress = state.get("progress", 0)
+            
+            progress_messages = {
+                "starting": "Initializing...",
+                "extracting_ner": "Analyzing conversation to understand preferences...",
+                "ner_completed": "Preferences extracted...",
+                "processing_search_call": "Determining if search is needed...",
+                "search_call_completed": "Search requirements determined...",
+                "simulating_search": "Searching for hotels matching your criteria...",
+                "search_completed": "Search complete...",
+                "search_not_needed": "No search needed at this time...",
+                "generating_assistant_response": "Generating response...",
+                "assistant_response_generated": "Response generated...",
+                "evaluating_response": "Evaluating response quality...",
+                "critique_completed": "Response evaluation complete...",
+                "regenerating_response": "Improving response based on feedback...",
+                "regeneration_completed": "Response improved...",
+                "regeneration_skipped": "Response meets quality standards..."
+            }
+            
+            if step in progress_messages:
+                progress_text = progress_messages[step]
+            else:
+                progress_text = f"Processing ({step})..."
+                
+            assistant_msg.content = f"[{progress_text} {progress}%]"
+            
+        db.session.commit()
+
+    # Capture initial state
+    try:
+        update_message_from_state()
+    except Exception as e:
+        print(f"[ERROR] Failed to update message initially: {e}")
+    
+    # Main monitoring loop
+    while retries < max_retries:
+        # Get the current processing state
+        state = llm_processing.get_processing_state(chat_id)
+        if not state:
+            print(f"[ERROR] Processing state not found for chat {chat_id}")
+            break
+            
+        # If processing completed or errored out, update the message and exit
+        if state["completed"] or state["status"] == "error":
+            try:
+                update_message_from_state()
+            except Exception as e:
+                print(f"[ERROR] Failed to update message at completion: {e}")
+            break
+            
+        # If still processing, update the message with progress information
+        try:
+            update_message_from_state()
+        except Exception as e:
+            print(f"[ERROR] Failed to update progress message: {e}")
+            
+        # Wait before next check
+        time.sleep(check_interval)
+        retries += 1
+    
+    # If we hit max retries, update the message with an error
+    if retries >= max_retries:
+        error_msg = f"Processing timed out after {max_retries * check_interval} seconds"
+        try:
+            # Update the message with the error
+            assistant_msg = AssistantMessage.query.filter_by(
+                message_id=message_id, 
+                output_number=output_number
+            ).first()
+            
+            if assistant_msg:
+                assistant_msg.content = f"[Error: {error_msg}]"
+                db.session.commit()
+        except Exception as e:
+            print(f"[ERROR] Failed to update message on timeout: {e}")
 
 def get_total_score_from_critic(critic_result):
     """
@@ -270,12 +450,13 @@ def monitor_processing_state(chat_id, message_id, output_number, check_interval=
     """
     retries = 0
     
-    # Import Flask's app outside the loop to avoid repeated imports
+    # Import Flask app at the top level
     from flask import current_app
+    # Get the app object once before starting the loop
     app = current_app._get_current_object()
     
-    def update_with_context():
-        """Function to run within app context"""
+    # Define a function that runs with app context
+    def update_with_app_context():
         with app.app_context():
             # Get the current message
             assistant_msg = AssistantMessage.query.filter_by(
@@ -357,7 +538,9 @@ def monitor_processing_state(chat_id, message_id, output_number, check_interval=
     
     # Capture initial state before starting the loop
     try:
-        update_with_context()
+        # Run the initial update within the app context
+        with app.app_context():
+            update_with_app_context()
     except Exception as e:
         print(f"[ERROR] Failed to update message initially: {e}")
     
@@ -372,14 +555,18 @@ def monitor_processing_state(chat_id, message_id, output_number, check_interval=
         # If processing completed or errored out, update the message and exit
         if state["completed"] or state["status"] == "error":
             try:
-                update_with_context()
+                # Run update with app context
+                with app.app_context():
+                    update_with_app_context()
             except Exception as e:
                 print(f"[ERROR] Failed to update message at completion: {e}")
             break
             
         # If still processing, update the message with progress information
         try:
-            update_with_context()
+            # Run update with app context
+            with app.app_context():
+                update_with_app_context()
         except Exception as e:
             print(f"[ERROR] Failed to update progress message: {e}")
             
@@ -403,7 +590,7 @@ def monitor_processing_state(chat_id, message_id, output_number, check_interval=
                     db.session.commit()
         except Exception as e:
             print(f"[ERROR] Failed to update message on timeout: {e}")
-            
+
 def update_assistant_progress_message(state, message_id, output_number):
     """
     Update the assistant message with progress information.

@@ -2,6 +2,7 @@ import json
 from openai import OpenAI
 from dotenv import load_dotenv
 from together import Together
+import re
 
 load_dotenv()  # Load environment variables from .env file if present
 
@@ -21,7 +22,6 @@ except Exception as e:
     print(f"[CRITIC] Error initializing OpenAI client: {e}")
     client = None
 
-
 def get_score(conversation_history: list, search_history: list = []) -> int:
     """
     Calculate and return a rating based on the conversation and search histories.
@@ -36,10 +36,6 @@ def get_score(conversation_history: list, search_history: list = []) -> int:
     Returns:
         int: The extracted rating if the process is successful. In case of an error during prompt preparation,
              API call, JSON decoding, or if the expected score data is missing, the function returns -1.0.
-    Notes:
-        - The critic prompt is logged to "logs/critic_prompt.log".
-        - Any errors encountered during processing (e.g., formatting, API invocation, parsing) are logged to
-          "logs/critic_error.log" and result in a return value of -1.0.
     """
 
     # Open the file using the resolved absolute path
@@ -117,10 +113,13 @@ def get_score(conversation_history: list, search_history: list = []) -> int:
         file.write("-" * 50 + "\n" * 5)
     
     try:
-        # Try to find JSON in the critic response
+        # FIRST CHANGE: Remove <think> tags before JSON parsing
+        think_pattern = r'<think>(.*?)</think>\s*'
+        response_without_thinking = re.sub(think_pattern, '', response, flags=re.DOTALL).strip()
+        
+        # Try to find JSON in the critic response (using response without thinking tags)
         json_pattern = r'(\{[\s\S]*\})'
-        import re
-        json_match = re.search(json_pattern, response)
+        json_match = re.search(json_pattern, response_without_thinking)
         
         if json_match:
             try:
@@ -152,9 +151,9 @@ def get_score(conversation_history: list, search_history: list = []) -> int:
             except json.JSONDecodeError:
                 print("[CRITIC] Failed to parse JSON from match")
         
-        # If no JSON found, try to find standalone score
+        # If no JSON found, try to find standalone score in response without thinking tags
         score_pattern = r'total_score[\s:"]*(\d+\.?\d*)'
-        score_match = re.search(score_pattern, response, re.IGNORECASE)
+        score_match = re.search(score_pattern, response_without_thinking, re.IGNORECASE)
         if score_match:
             try:
                 return float(score_match.group(1))

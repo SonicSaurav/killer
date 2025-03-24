@@ -408,13 +408,16 @@ def process_search_simulation(search_call, chat_id=None):
                 else:
                     num_matches = 10  # Default
         
+        # Set threshold for showing results to the agent
+        threshold = 50
+        
         # Build search record
         search_record = {
             "timestamp": datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
             "parameters": function_call_content,
             "results": search_response,
             "num_matches": num_matches,
-            "show_results_to_actor": num_matches <= 50
+            "show_results_to_actor": num_matches <= threshold
         }
         
         update_processing_state(
@@ -431,7 +434,7 @@ def process_search_simulation(search_call, chat_id=None):
         log_error(error_msg, chat_id)
         update_processing_state(chat_id, error=error_msg)
         return None
-
+    
 def generate_assistant_response(conversation_history, search_record=None, chat_id=None):
     """Generate the assistant response based on conversation and search."""
     update_processing_state(chat_id, status="processing", step="generating_assistant_response", progress=70)
@@ -455,10 +458,14 @@ def generate_assistant_response(conversation_history, search_record=None, chat_i
         num_matches = ""
         
         if search_record:
+            # Only provide search results and count if show_results_to_actor is True
             if search_record.get("show_results_to_actor", False):
                 search_text = search_record.get("results", "")
-            if "num_matches" in search_record:
-                num_matches = str(search_record["num_matches"])
+                
+                # Only provide the count when showing results
+                if "num_matches" in search_record:
+                    num_matches = str(search_record["num_matches"])
+            # If not showing results, don't provide the count either
         
         # Build the final prompt
         agent_prompt = (
@@ -504,7 +511,7 @@ def generate_assistant_response(conversation_history, search_record=None, chat_i
         log_error(error_msg, chat_id)
         update_processing_state(chat_id, error=error_msg)
         return None
-
+    
 def get_critic_evaluation(conversation_history, assistant_response, search_record=None, chat_id=None):
     """
     Get a critique of the assistant's response using critic.md.
