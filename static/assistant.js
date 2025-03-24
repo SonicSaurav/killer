@@ -1,6 +1,10 @@
 // Global variable to keep track of the current chat ID.
 let currentChatId = null;
 
+// Track processing status
+let processingInterval = null;
+let processingData = {};
+
 /**
  * Updates the chat ID display on the frontend.
  */
@@ -29,15 +33,10 @@ async function startNewChat() {
     }
 }
 
-
 /**
  * If second assistant is enabled, we add a button below both assistant messages.
  * Clicking this "Prefer" button will mark that output as preferred.
  * Then we hide the other assistant output from the same parent message.
- *
- * We'll call /assistant/chat/<chat_id>/message/<message_id>/prefer.
- * This route requires { preferred_output: 1 or 2 } in the POST body.
- * On success, we hide the sibling message.
  */
 async function preferOutput(parentMessageId, outputNumber) {
     if (!currentChatId) {
@@ -77,14 +76,6 @@ async function preferOutput(parentMessageId, outputNumber) {
  * If the message is from the assistant and includes a critic score,
  * a small circle with the score is added.
  * If second assistant is enabled, we also add a "Prefer" button.
- *
- * @param {string} id            - The unique assistant_message ID.
- * @param {string} text          - The message content.
- * @param {string} role          - 'assistant' or 'user'.
- * @param {string} [criticScore] - (Optional) The critic score.
- * @param {boolean} [isDummy]    - (Optional) If this message is a placeholder.
- * @param {string} [parentId]    - The parent Message ID.
- * @param {number} [outputNumber]- The assistant output number (1 or 2).
  */
 function addMessageToChat(
     id,
@@ -93,13 +84,20 @@ function addMessageToChat(
     criticScore,
     isDummy = false,
     parentId = null,
-    outputNumber = null
+    outputNumber = null,
+    extraData = null
 ) {
     const messagesContainer = document.getElementById('messages');
 
     // Check if the message already exists
     let existingMessage = document.querySelector(`[data-message-id='${id}']`);
     if (existingMessage) {
+        // Update the text content if it's changed (for async processing updates)
+        const textSpan = existingMessage.querySelector('.message-text');
+        if (textSpan && textSpan.textContent !== text) {
+            textSpan.textContent = text;
+        }
+        
         // Update the critic score if needed
         if (criticScore !== undefined) {
             let criticCircle = existingMessage.querySelector('.critic-score');
@@ -110,7 +108,13 @@ function addMessageToChat(
             }
             criticCircle.textContent = criticScore;
         }
-        return;
+        
+        // Update extra data if provided
+        if (extraData) {
+            updateExtraDataSection(existingMessage, extraData);
+        }
+        
+        return existingMessage;
     }
 
     // Create the message bubble container.
@@ -131,6 +135,7 @@ function addMessageToChat(
 
     // Create an element for the message text.
     const textSpan = document.createElement('span');
+    textSpan.className = 'message-text';
     textSpan.textContent = text;
     bubbleDiv.appendChild(textSpan);
 
@@ -159,12 +164,286 @@ function addMessageToChat(
         };
         bubbleDiv.appendChild(preferBtn);
     }
+    
+    // Add extra data sections if provided
+    if (extraData) {
+        updateExtraDataSection(bubbleDiv, extraData);
+    }
 
     // Assign classes for styling.
     bubbleDiv.classList.add(role === 'assistant' ? 'assistant-message' : 'user-message');
 
     messagesContainer.appendChild(bubbleDiv);
     messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    
+    return bubbleDiv;
+}
+
+/**
+ * Updates or creates sections for extra message data like NER results, search results, etc.
+ */
+function updateExtraDataSection(messageElement, extraData) {
+    // Process each type of extra data
+    if (extraData.ner_result) {
+        addOrUpdateSection(messageElement, 'ner-result', 'Extracted Preferences', formatJsonAsHtml(extraData.ner_result));
+    }
+    
+    if (extraData.search_call_result) {
+        addOrUpdateSection(messageElement, 'search-call', 'Search Query', extraData.search_call_result);
+    }
+    
+    if (extraData.search_result) {
+        const searchResultContent = extraData.search_result.results || "No results available";
+        addOrUpdateSection(messageElement, 'search-result', 'Search Results', searchResultContent);
+    }
+    
+    if (extraData.thinking) {
+        addOrUpdateSection(messageElement, 'thinking', 'Assistant Reasoning', extraData.thinking);
+    }
+    
+    if (extraData.critic_result) {
+        let criticContent = "";
+        try {
+            const criticData = typeof extraData.critic_result === 'string' 
+                ? JSON.parse(extraData.critic_result) 
+                : extraData.critic_result;
+                
+            // Format the critic result nicely
+            criticContent = formatCriticResult(criticData);
+        } catch (e) {
+            criticContent = "Failed to parse critic data: " + e.message;
+        }
+        addOrUpdateSection(messageElement, 'critic-result', 'Response Evaluation', criticContent);
+    }
+    
+    if (extraData.regenerated_content) {
+        addOrUpdateSection(messageElement, 'regenerated-content', 'Improved Response', extraData.regenerated_content);
+    }
+    
+    if (extraData.regenerated_critic) {
+        let regeneratedCriticContent = "";
+        try {
+            const regeneratedCriticData = typeof extraData.regenerated_critic === 'string' 
+                ? JSON.parse(extraData.regenerated_critic) 
+                : extraData.regenerated_critic;
+                
+            // Format the regenerated critic nicely
+            regeneratedCriticContent = formatCriticResult(regeneratedCriticData);
+        } catch (e) {
+            regeneratedCriticContent = "Failed to parse regenerated critic data: " + e.message;
+        }
+        addOrUpdateSection(messageElement, 'regenerated-critic', 'Improved Response Evaluation', regeneratedCriticContent);
+    }
+}
+
+/**
+ * Adds or updates a collapsible section in a message bubble.
+ */
+function addOrUpdateSection(parentElement, sectionId, title, content) {
+    // Check if section already exists
+    let section = parentElement.querySelector(`[data-section-id="${sectionId}"]`);
+    
+    if (section) {
+        // Update existing section content
+        const contentDiv = section.querySelector('.section-content');
+        if (contentDiv) {
+            contentDiv.innerHTML = content;
+        }
+        return;
+    }
+    
+    // Create new section
+    section = document.createElement('div');
+    section.className = 'mt-3 border-t pt-2 w-full';
+    section.setAttribute('data-section-id', sectionId);
+    
+    // Create toggle button
+    const toggleBtn = document.createElement('button');
+    toggleBtn.className = 'text-xs bg-gray-200 hover:bg-gray-300 text-gray-800 font-semibold py-1 px-2 rounded';
+    toggleBtn.textContent = `Show ${title}`;
+    
+    // Create content container (hidden initially)
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'section-content mt-2 text-xs bg-gray-100 p-2 rounded overflow-auto max-h-40 hidden';
+    contentDiv.innerHTML = content;
+    
+    // Add click handler for toggle
+    toggleBtn.onclick = () => {
+        const isHidden = contentDiv.classList.contains('hidden');
+        contentDiv.classList.toggle('hidden');
+        toggleBtn.textContent = isHidden ? `Hide ${title}` : `Show ${title}`;
+    };
+    
+    // Add elements to section
+    section.appendChild(toggleBtn);
+    section.appendChild(contentDiv);
+    
+    // Add section to parent
+    parentElement.appendChild(section);
+}
+
+/**
+ * Format JSON object as formatted HTML.
+ */
+function formatJsonAsHtml(jsonObj) {
+    try {
+        if (typeof jsonObj === 'string') {
+            jsonObj = JSON.parse(jsonObj);
+        }
+        return '<pre>' + JSON.stringify(jsonObj, null, 2) + '</pre>';
+    } catch (e) {
+        return '<pre>Error formatting: ' + e.message + '</pre>';
+    }
+}
+
+/**
+ * Format critic result in a readable way.
+ */
+function formatCriticResult(criticData) {
+    if (!criticData) return "No critique available";
+    
+    let html = '<div class="critic-result">';
+    
+    // Add total score if present
+    if (criticData.total_score !== undefined) {
+        html += `<div class="font-bold">Score: ${criticData.total_score}</div>`;
+    }
+    
+    // Add summary if present
+    if (criticData.summary) {
+        html += `<div class="mt-1"><strong>Summary:</strong> ${criticData.summary}</div>`;
+    }
+    
+    // Add category scores
+    const categories = [
+        'adherence_to_search', 
+        'question_format',
+        'conversational_quality',
+        'contextual_intelligence',
+        'overall_effectiveness'
+    ];
+    
+    // Build table of scores
+    let tableHtml = '<table class="mt-2 w-full text-xs border-collapse">';
+    tableHtml += '<tr><th class="text-left">Category</th><th class="text-right">Score</th></tr>';
+    
+    categories.forEach(category => {
+        if (criticData[category]) {
+            const score = criticData[category].score;
+            const categoryName = category.split('_').map(word => 
+                word.charAt(0).toUpperCase() + word.slice(1)
+            ).join(' ');
+            
+            tableHtml += `<tr>
+                <td>${categoryName}</td>
+                <td class="text-right">${score}</td>
+            </tr>`;
+        }
+    });
+    
+    tableHtml += '</table>';
+    html += tableHtml;
+    
+    return html;
+}
+
+/**
+ * Polls the server for processing status updates for a message.
+ */
+function startProcessingPolling(messageId, outputNumber) {
+    // Clear any existing interval
+    if (processingInterval) {
+        clearInterval(processingInterval);
+    }
+    
+    const pollingFunc = async () => {
+        if (!currentChatId) return;
+        
+        try {
+            const chatIdForRequest = outputNumber === 2 ? `${currentChatId}_second` : currentChatId;
+            const response = await fetch(`/assistant/chat/processing/${chatIdForRequest}`, {
+                method: 'GET',
+                headers: { 'Content-Type': 'application/json' }
+            });
+            
+            if (!response.ok) {
+                console.error('Error fetching processing status:', response.statusText);
+                return;
+            }
+            
+            const data = await response.json();
+            
+            // Update processingData
+            processingData[messageId] = data;
+            
+            // Get the message element
+            const messageElement = document.querySelector(`[data-message-id='${messageId}']`);
+            if (!messageElement) {
+                console.warn(`Message element not found: ${messageId}`);
+                return;
+            }
+            
+            // Update the message text with progress
+            const textSpan = messageElement.querySelector('.message-text');
+            if (textSpan && data.status === 'processing') {
+                textSpan.textContent = `[${data.step}: ${data.progress}%]`;
+            }
+            
+            // Add extra data sections as they become available
+            updateExtraDataSection(messageElement, data);
+            
+            // If completed or error, stop polling and update the message
+            if (data.completed || data.status === 'error') {
+                clearInterval(processingInterval);
+                processingInterval = null;
+                
+                // If there's a final response, update the message text
+                if (data.final_response) {
+                    if (textSpan) {
+                        textSpan.textContent = data.final_response;
+                    }
+                    
+                    // Add critic score if available
+                    if (data.critic_result) {
+                        let criticScore = null;
+                        try {
+                            const criticData = typeof data.critic_result === 'string' 
+                                ? JSON.parse(data.critic_result) 
+                                : data.critic_result;
+                                
+                            criticScore = criticData.total_score;
+                            
+                            if (criticScore !== undefined) {
+                                let criticCircle = messageElement.querySelector('.critic-score');
+                                if (!criticCircle) {
+                                    criticCircle = document.createElement('div');
+                                    criticCircle.className = 'critic-score absolute top-0 right-0 mt-1 mr-1 text-xs text-white bg-red-500 rounded-full w-5 h-5 flex items-center justify-center';
+                                    messageElement.appendChild(criticCircle);
+                                }
+                                criticCircle.textContent = criticScore;
+                            }
+                        } catch (e) {
+                            console.error('Error parsing critic score:', e);
+                        }
+                    }
+                }
+                
+                // If there's an error, update the message text
+                if (data.error) {
+                    if (textSpan) {
+                        textSpan.textContent = `[Error: ${data.error}]`;
+                    }
+                }
+            }
+            
+        } catch (err) {
+            console.error('Error polling for processing status:', err);
+        }
+    };
+    
+    // Call immediately and then set interval
+    pollingFunc();
+    processingInterval = setInterval(pollingFunc, 1000);
 }
 
 /**
@@ -191,9 +470,24 @@ async function pollCriticScores() {
                         criticCircle.className = 'critic-score absolute top-0 right-0 mt-1 mr-1 text-xs text-white bg-red-500 rounded-full w-5 h-5 flex items-center justify-center';
                         existingMessage.appendChild(criticCircle);
                     }
+                    
+                    // Parse critic score from the data
+                    let criticScore = null;
+                    try {
+                        if (scoreObj.critic_score) {
+                            const criticData = typeof scoreObj.critic_score === 'string' 
+                                ? JSON.parse(scoreObj.critic_score) 
+                                : scoreObj.critic_score;
+                                
+                            criticScore = criticData.total_score;
+                        }
+                    } catch (e) {
+                        console.error('Error parsing critic score:', e);
+                    }
+                    
                     // Check if the score has changed
-                    if (scoreObj.critic_score !== null && criticCircle.textContent !== scoreObj.critic_score.toString()) {
-                        criticCircle.textContent = scoreObj.critic_score;
+                    if (criticScore !== null && criticCircle.textContent !== criticScore.toString()) {
+                        criticCircle.textContent = criticScore;
 
                         // Force a DOM update by toggling opacity
                         existingMessage.style.opacity = '0.99';
@@ -278,28 +572,34 @@ async function sendToServer(userInput) {
 
             // assistant_message (primary)
             if (data.assistant_message) {
-                addMessageToChat(
+                const messageBubble = addMessageToChat(
                     data.assistant_message.id,
                     data.assistant_message.content,
                     'assistant',
-                    data.assistant_message.critic_score,
+                    getTotalScoreFromCritic(data.assistant_message.critic_score),
                     false,
                     data.id, // use the parent 'Message' id
                     data.assistant_message.output_number // might be 1
                 );
+                
+                // Start polling for processing status
+                startProcessingPolling(data.assistant_message.id, 1);
             }
 
             // assistant_message2 (secondary)
             if (data.assistant_message2) {
-                addMessageToChat(
+                const messageBubble2 = addMessageToChat(
                     data.assistant_message2.id,
                     data.assistant_message2.content,
                     'assistant',
-                    data.assistant_message2.critic_score,
+                    getTotalScoreFromCritic(data.assistant_message2.critic_score),
                     false,
                     data.id, // same parent message ID
                     data.assistant_message2.output_number // might be 2
                 );
+                
+                // Start polling for processing status for second assistant
+                startProcessingPolling(data.assistant_message2.id, 2);
             }
         }, 1000);
 
@@ -307,6 +607,26 @@ async function sendToServer(userInput) {
         console.error('Error sending to server:', err);
         removeDummyMessages();
         addMessageToChat('error', "Error: Failed to get response from server.", 'assistant');
+    }
+}
+
+/**
+ * Extract total_score from critic data.
+ */
+function getTotalScoreFromCritic(criticData) {
+    if (!criticData) return undefined;
+    
+    try {
+        // Parse if it's a string
+        const criticJson = typeof criticData === 'string' 
+            ? JSON.parse(criticData) 
+            : criticData;
+            
+        // Return total_score if it exists
+        return criticJson.total_score;
+    } catch (e) {
+        console.error('Error parsing critic data:', e);
+        return undefined;
     }
 }
 
@@ -397,6 +717,3 @@ setInterval(pollCriticScores, 5000);
 
 document.addEventListener("DOMContentLoaded", startNewChat);
 updateChatIdDisplay();
-// Automatically start a new chat on DOM load
-
-

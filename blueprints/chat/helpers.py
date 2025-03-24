@@ -2,11 +2,15 @@ import re
 from openai import OpenAI
 from models.models import AssistantMessage, Chat, Message, UserMessage, db
 from together import Together
+from datetime import datetime
+import json
+import threading
+import time
+from . import llm_processing
 
 ##############################################
 # Helper Functions
 ##############################################
-
 
 client = OpenAI()
 
@@ -61,266 +65,452 @@ def create_user_message(chat, user_input):
     return message
 
 
-def generate_assistant_response(
-    chat,
-    base_prompt_path,
-    search_prompt_path,
-    conversation_history,
-    search_history,
-    assistant,
+def store_assistant_message(
+    message_id, 
+    content, 
+    search_output=None, 
+    output_number=1,
+    thinking=None,
+    critic_score=None,
+    regenerated_content=None,
+    regenerated_critic=None
 ):
     """
-    Generate an assistant response based on the conversation and search history.
-
-        This function reads a base prompt from a file and customizes it with the provided conversation and search history. It then requests a response from a chat completions API. If the generated response indicates that a search is needed (by containing specific tags), it extracts a search query, generates search results using a separate prompt, and finally produces a second-pass response that integrates the new search results.
-
-        Parameters:
-            chat (object): An object representing the current chat context. It should provide a method get_conversation_history() to retrieve the updated conversation history.
-            base_prompt_path (str): File path to the base prompt template.
-            search_prompt_path (str): File path to the search prompt template.
-            conversation_history (Any): The history of the conversation to be incorporated into the prompt.
-            search_history (Any): The history of previous search interactions to be incorporated into the prompt.
-            assistant (Any): A seed or identifier used to influence the response generation.
-
-        Returns:
-            tuple: A tuple containing:
-                - assistant_message_content (str): The final assistant response text.
-                - search_results (str or None): The generated search results if a search was triggered, otherwise None.
-
-        Notes:
-            - Logs of the prompts and responses are written to files under the "logs" directory.
-            - If an error occurs during any request, the function prints an error message and returns (None, None).
-    """
-    # 1) Read the base prompt
-    with open(base_prompt_path, "r") as file:
-        prompt = file.read()
-
-    # 2) Build the prompt with conversation history and search history
-    updated_prompt = prompt.replace("{conv}", str(conversation_history)).replace(
-        "{search}", str(search_history)
-    )
-
-    with open("logs/assistant_prompt.log", "a+") as file:
-        file.write(f"{updated_prompt}\n")
-        file.write("-" * 50 + "\n" * 5)
-
-    # 3) Attempt first generation
-    try:
-        client = Together(api_key='a923ff51a697d6812f846b69aea86466853cceaf95c8ab2dfc84de07cce6ffe1')
-        completion = client.chat.completions.create(
-            model="deepseek-ai/DeepSeek-R1",  # Updated model
-            messages=[
-                {
-                    "role": "user",
-                    "content": updated_prompt,
-                }
-            ],
-            seed=assistant,
-            temperature=0.6 ,
-        )
-    except Exception as e:
-        print(f"[ERROR] Failed to generate a response: {e}")
-        return None, None
-
-    think_tag_end = completion.choices[0].message.content
-    # Find the position of the closing think tag
-    assistant_message_content = think_tag_end.find('</think>')
+    Stores an assistant message in the database with enhanced information.
     
-    if assistant_message_content != -1:
-        # Extract only the content after </think>
-        assistant_message_content = think_tag_end[assistant_message_content + len('</think>'):].strip()
-    else:
-        # If no </think> tag is found, return the full content
-        assistant_message_content = think_tag_end.strip()
-
-    # 4) If the content suggests a search is needed, parse out the search query and do a second pass
-    search_results = None
-    if (
-        "<function>" in assistant_message_content
-    ):
-        print("[DEBUG] Search needed")
-        # Split at <function>
-        splitted = re.split(r"<function>", assistant_message_content)
-        if len(splitted) > 1:
-            assistant_message_content = splitted[0]
-            search_query = splitted[1]
-
-            with open(search_prompt_path, "r") as file:
-                search_prompt = file.read()
-            search_prompt = search_prompt.replace("{search_query}", search_query)
-
-            with open("logs/search_prompt.log", "a") as file:
-                file.write(f"{search_prompt}\n")
-                file.write("-" * 50 + "\n" * 5)
-
-            # Generate the search results
-            try:
-                search = client.chat.completions.create(
-                    model="o3-mini-2025-01-31",
-                    messages=[{"role": "user", "content": search_prompt}],
-                    seed=assistant,
-                )
-                search_results = search.choices[0].message.content
-            except Exception as e:
-                print(f"[ERROR] Failed to generate search results: {e}")
-
-            # After obtaining search results, we re-generate a final assistant message
-            print("[DEBUG] Prompt updated with search results.")
-            # Use updated conversation history from chat plus these search results.
-            second_prompt = prompt.replace(
-                "{conv}", str(chat.get_conversation_history())
-            ).replace("{search}", str(search_results))
-
-            with open("logs/assistant_prompt_after_search.log", "a") as file:
-                file.write(f"{second_prompt}\n")
-                file.write("-" * 50 + "\n" * 5)
-
-            try:
-                completion2 = client.chat.completions.create(
-                    model="o3-mini-2025-01-31",
-                    # model="gpt-4o",
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": second_prompt,
-                        }
-                    ],
-                    seed=assistant,
-                    # temperature=0.4 if assistant == 1 else 0.7,
-                )
-                assistant_message_content = completion2.choices[0].message.content
-                print(
-                    f"[DEBUG] Assistant message after search: {assistant_message_content}"
-                )
-            except Exception as e:
-                print(f"[ERROR] Failed to generate second pass response: {e}")
-        else:
-            print("[DEBUG] <function> tag found but no query to search.")
-    else:
-        print("[DEBUG] Search not needed")
-
-    return assistant_message_content, search_results
-
-
-def store_assistant_message(message_id, content, search_output=None, output_number=1):
-    """
-    Stores an assistant message in the database.
-    This function creates a new instance of AssistantMessage using the provided parameters,
-    adds it to the database session, commits the transaction, and returns the stored message.
     Args:
-        message_id (int or str): A unique identifier for the message.
+        message_id (str): A unique identifier for the message.
         content (str): The textual content of the assistant's message.
-        search_output (optional): Additional search output associated with the message. Defaults to None.
-        output_number (int, optional): The sequence number or identifier of the output. Defaults to 1.
+        search_output (dict, optional): Search output data associated with the message.
+        output_number (int, optional): The sequence number of the output. Defaults to 1.
+        thinking (str, optional): The assistant's reasoning process.
+        critic_score (dict, optional): The evaluation scores from the critic.
+        regenerated_content (str, optional): Regenerated response if original had low score.
+        regenerated_critic (dict, optional): Critic evaluation of the regenerated response.
+    
     Returns:
         AssistantMessage: The assistant message object that was stored in the database.
     """
-
+    # Store critic_score as JSON string if provided
+    critic_score_json = None
+    if critic_score:
+        try:
+            critic_score_json = json.dumps(critic_score)
+        except:
+            pass
+            
+    # Create the assistant message
     assistant_msg = AssistantMessage(
         message_id=message_id,
         content=content,
-        search_output=search_output,
+        search_output=json.dumps(search_output) if search_output else None,
         output_number=output_number,
+        thinking=thinking,
+        critic_score=critic_score_json,
+        regenerated_content=regenerated_content,
+        regenerated_critic=json.dumps(regenerated_critic) if regenerated_critic else None
     )
+    
     db.session.add(assistant_msg)
     db.session.commit()
     return assistant_msg
+
+
+def process_conversation_history(conversation_history):
+    """
+    Convert a conversation history from the database format to the format expected by the LLM processing module.
+    """
+    processed_history = []
+    for msg in conversation_history:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role and content:
+            processed_history.append({"role": role, "content": content})
+    return processed_history
 
 
 def generate_and_store_assistant_message(
     chat, message, base_prompt_path, search_prompt_path
 ):
     """
-    Generates an assistant response based on the current conversation and search history,
-    and stores the generated message along with any associated search results.
+    Starts asynchronous generation of an assistant response.
+    
+    This function initiates the asynchronous processing of generating an assistant response
+    based on the current conversation. It sets up the necessary parameters and starts a
+    background thread to handle the actual processing.
+    
     Parameters:
-        chat: An object representing the active chat session. It must support methods:
-              - get_conversation_history(): Returns the list of previous chat messages.
-              - get_search_history(): Returns the list of previous search queries/results.
-        message: An object representing the current message context with an attribute 'id'
-                 that uniquely identifies the message.
-        base_prompt_path: A string representing the file path to the base prompt template used
-                          for generating the assistant's response.
-        search_prompt_path: A string representing the file path to the prompt template used for
-                            generating search-related outputs.
-    Process:
-        1. Retrieves conversation and search history from the provided chat session.
-        2. Calls the generate_assistant_response function to obtain the assistant's message content
-           and any search results. A fallback error message is used if no valid response is generated.
-        3. Stores the assistant message output by calling store_assistant_message, including any
-           search output if available.
+        chat: An object representing the active chat session.
+        message: An object representing the current message context.
+        base_prompt_path: No longer used directly; kept for compatibility.
+        search_prompt_path: No longer used directly; kept for compatibility.
+    
     Returns:
         None
     """
-
+    # Get conversation history
     conversation_history = chat.get_conversation_history()
-    search_history = chat.get_search_history()
-
-    assistant_message_content, search_results = generate_assistant_response(
-        chat,
-        base_prompt_path,
-        search_prompt_path,
-        conversation_history,
-        search_history,
-        assistant=1,
+    processed_history = process_conversation_history(conversation_history)
+    
+    # Start asynchronous processing
+    processing_state = llm_processing.start_processing_thread(
+        chat_id=chat.id,
+        conversation_history=processed_history,
+        enable_search=True,
+        evaluate_response=True,
+        regenerate_response=True
     )
-
-    if assistant_message_content is None:
-        # Return some fallback or error message if generation fails
-        print("[ERROR] No assistant message content generated.")
-        assistant_message_content = "[Error: assistant failed to respond.]"
-
-    # Store the assistant message (primary output)
+    
+    # Create a placeholder assistant message that will be updated when processing completes
     store_assistant_message(
         message_id=message.id,
-        content=assistant_message_content,
-        search_output=search_results if search_results else None,
-        output_number=1,
+        content="[Processing your request...]",
+        search_output=None,
+        output_number=1
     )
+    
+    # Start a background thread to periodically check the processing state and update the message
+    threading.Thread(
+        target=monitor_processing_state,
+        args=(chat.id, message.id, 1)
+    ).start()
 
 
 def maybe_generate_second_assistant_message(
     chat, message, base_prompt_path, search_prompt_path
 ):
     """
-    Generate a response for the second assistant and store the message.
-    This function retrieves the conversation and search history from the provided chat object,
-    generates a response using the given prompt paths via the generate_assistant_response function,
-    and then stores the assistant's message along with any search results. If the response for the
-    second assistant is not generated, an error message is assigned instead.
-    Args:
-        chat: An object representing the chat, which provides methods to get conversation and search history.
-        message: The message object associated with this interaction. It must contain an attribute `id`
-                 used for storing the assistant's output.
-        base_prompt_path (str): File path to the base prompt used for generating the assistant's response.
-        search_prompt_path (str): File path to the search prompt used for generating the assistant's response.
-    Notes:
-        - The generate_assistant_response function is called with assistant set to 2 to designate the
-          secondary assistant.
-        - If no valid response is generated (i.e., assistant_message_content is None), an error message
-          is assigned.
-        - The assistant's message is stored using store_assistant_message with output_number set to 2,
-          and search results are included if available.
+    Starts asynchronous generation of a second assistant response.
+    
+    Similar to generate_and_store_assistant_message but for the second assistant.
+    Uses a different seed value to ensure variation.
+    
+    Parameters:
+        chat: An object representing the chat.
+        message: The message object associated with this interaction.
+        base_prompt_path: No longer used directly; kept for compatibility.
+        search_prompt_path: No longer used directly; kept for compatibility.
     """
+    # Get conversation history
     conversation_history = chat.get_conversation_history()
-    search_history = chat.get_search_history()
-
-    assistant_message_content, search_results = generate_assistant_response(
-        chat,
-        base_prompt_path,
-        search_prompt_path,
-        conversation_history,
-        search_history,
-        assistant=2,
+    processed_history = process_conversation_history(conversation_history)
+    
+    # Start asynchronous processing with a different seed
+    processing_state = llm_processing.start_processing_thread(
+        chat_id=f"{chat.id}_second",  # Different chat_id for the second assistant
+        conversation_history=processed_history,
+        enable_search=True,
+        evaluate_response=True,
+        regenerate_response=True
     )
-
-    if assistant_message_content is None:
-        assistant_message_content = "[Error]: second assistant failed to respond."
-
-    # Store the assistant message (secondary output)
+    
+    # Create a placeholder assistant message that will be updated when processing completes
     store_assistant_message(
         message_id=message.id,
-        content=assistant_message_content,
-        search_output=search_results if search_results else None,
-        output_number=2,
+        content="[Processing your request for second assistant...]",
+        search_output=None,
+        output_number=2
     )
+    
+    # Start a background thread to periodically check the processing state and update the message
+    threading.Thread(
+        target=monitor_processing_state,
+        args=(f"{chat.id}_second", message.id, 2)
+    ).start()
+
+
+def get_total_score_from_critic(critic_result):
+    """
+    Extract total_score from the critic result.
+    The critic can return different JSON formats based on whether search results were present.
+    """
+    if not critic_result:
+        return None
+        
+    try:
+        # Try to parse if it's a string
+        if isinstance(critic_result, str):
+            critic_data = json.loads(critic_result)
+        else:
+            critic_data = critic_result
+            
+        # Extract total_score directly if present
+        if "total_score" in critic_data:
+            return critic_data["total_score"]
+        
+        # If no total_score, try to calculate from component scores
+        total = 0
+        if "adherence_to_search" in critic_data:
+            total += critic_data["adherence_to_search"].get("score", 0)
+        if "question_format" in critic_data:
+            total += critic_data["question_format"].get("score", 0)
+        if "conversational_quality" in critic_data:
+            total += critic_data["conversational_quality"].get("score", 0)
+        if "contextual_intelligence" in critic_data:
+            total += critic_data["contextual_intelligence"].get("score", 0)
+        if "overall_effectiveness" in critic_data:
+            total += critic_data["overall_effectiveness"].get("score", 0)
+            
+        return total if total > 0 else None
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to extract total score: {e}")
+        return None
+
+def monitor_processing_state(chat_id, message_id, output_number, check_interval=1, max_retries=300):
+    """
+    Monitor the processing state and update the message when processing completes.
+    
+    Parameters:
+        chat_id: The ID of the chat being processed.
+        message_id: The ID of the message to update.
+        output_number: The output number (1 for primary, 2 for secondary).
+        check_interval: How often to check the processing state (in seconds).
+        max_retries: Maximum number of retries before giving up.
+    """
+    retries = 0
+    
+    # Import Flask's app outside the loop to avoid repeated imports
+    from flask import current_app
+    app = current_app._get_current_object()
+    
+    def update_with_context():
+        """Function to run within app context"""
+        with app.app_context():
+            # Get the current message
+            assistant_msg = AssistantMessage.query.filter_by(
+                message_id=message_id, 
+                output_number=output_number
+            ).first()
+            
+            if not assistant_msg:
+                print(f"[ERROR] Assistant message not found: {message_id}, output_number: {output_number}")
+                return
+                
+            # Update with message
+            state = llm_processing.get_processing_state(chat_id)
+            if not state:
+                assistant_msg.content = "[Processing state not found]"
+                db.session.commit()
+                return
+                
+            if state["completed"] or state["status"] == "error":
+                # Final update
+                if state["status"] == "error" or state["error"]:
+                    error_msg = state["error"] or "Unknown error"
+                    assistant_msg.content = f"[Error: {error_msg}]"
+                elif state["final_response"]:
+                    assistant_msg.content = state["final_response"]
+                    
+                    # Update thinking
+                    if state.get("assistant_response") and state["assistant_response"].get("thinking"):
+                        assistant_msg.thinking = state["assistant_response"]["thinking"]
+                        
+                    # Update search output
+                    if state.get("search_result"):
+                        assistant_msg.search_output = json.dumps(state["search_result"])
+                        
+                    # Update critic score
+                    if state.get("critic_result"):
+                        assistant_msg.critic_score = json.dumps(state["critic_result"])
+                        
+                    # Update regenerated content if available
+                    if state.get("regenerated_response"):
+                        assistant_msg.regenerated_content = state["regenerated_response"]
+                        
+                    # Update regenerated critic if available
+                    if state.get("regenerated_critic"):
+                        assistant_msg.regenerated_critic = json.dumps(state["regenerated_critic"])
+                else:
+                    assistant_msg.content = "[No response generated]"
+            else:
+                # Progress update
+                step = state.get("step", "processing")
+                progress = state.get("progress", 0)
+                
+                progress_messages = {
+                    "starting": "Initializing...",
+                    "extracting_ner": "Analyzing conversation to understand preferences...",
+                    "ner_completed": "Preferences extracted...",
+                    "processing_search_call": "Determining if search is needed...",
+                    "search_call_completed": "Search requirements determined...",
+                    "simulating_search": "Searching for hotels matching your criteria...",
+                    "search_completed": "Search complete...",
+                    "search_not_needed": "No search needed at this time...",
+                    "generating_assistant_response": "Generating response...",
+                    "assistant_response_generated": "Response generated...",
+                    "evaluating_response": "Evaluating response quality...",
+                    "critique_completed": "Response evaluation complete...",
+                    "regenerating_response": "Improving response based on feedback...",
+                    "regeneration_completed": "Response improved...",
+                    "regeneration_skipped": "Response meets quality standards..."
+                }
+                
+                if step in progress_messages:
+                    progress_text = progress_messages[step]
+                else:
+                    progress_text = f"Processing ({step})..."
+                    
+                assistant_msg.content = f"[{progress_text} {progress}%]"
+                
+            db.session.commit()
+    
+    # Capture initial state before starting the loop
+    try:
+        update_with_context()
+    except Exception as e:
+        print(f"[ERROR] Failed to update message initially: {e}")
+    
+    # Main monitoring loop
+    while retries < max_retries:
+        # Get the current processing state
+        state = llm_processing.get_processing_state(chat_id)
+        if not state:
+            print(f"[ERROR] Processing state not found for chat {chat_id}")
+            break
+            
+        # If processing completed or errored out, update the message and exit
+        if state["completed"] or state["status"] == "error":
+            try:
+                update_with_context()
+            except Exception as e:
+                print(f"[ERROR] Failed to update message at completion: {e}")
+            break
+            
+        # If still processing, update the message with progress information
+        try:
+            update_with_context()
+        except Exception as e:
+            print(f"[ERROR] Failed to update progress message: {e}")
+            
+        # Wait before next check
+        time.sleep(check_interval)
+        retries += 1
+    
+    # If we hit max retries, update the message with an error
+    if retries >= max_retries:
+        error_msg = f"Processing timed out after {max_retries * check_interval} seconds"
+        try:
+            # Update the message with the error
+            with app.app_context():
+                assistant_msg = AssistantMessage.query.filter_by(
+                    message_id=message_id, 
+                    output_number=output_number
+                ).first()
+                
+                if assistant_msg:
+                    assistant_msg.content = f"[Error: {error_msg}]"
+                    db.session.commit()
+        except Exception as e:
+            print(f"[ERROR] Failed to update message on timeout: {e}")
+            
+def update_assistant_progress_message(state, message_id, output_number):
+    """
+    Update the assistant message with progress information.
+    """
+    try:
+        # Get the current message
+        assistant_msg = AssistantMessage.query.filter_by(
+            message_id=message_id, 
+            output_number=output_number
+        ).first()
+        
+        if assistant_msg:
+            # Build a progress message based on the current step
+            step = state.get("step", "processing")
+            progress = state.get("progress", 0)
+            
+            progress_messages = {
+                "starting": "Initializing...",
+                "extracting_ner": "Analyzing conversation to understand preferences...",
+                "ner_completed": "Preferences extracted...",
+                "processing_search_call": "Determining if search is needed...",
+                "search_call_completed": "Search requirements determined...",
+                "simulating_search": "Searching for hotels matching your criteria...",
+                "search_completed": "Search complete...",
+                "search_not_needed": "No search needed at this time...",
+                "generating_assistant_response": "Generating response...",
+                "assistant_response_generated": "Response generated...",
+                "evaluating_response": "Evaluating response quality...",
+                "critique_completed": "Response evaluation complete...",
+                "regenerating_response": "Improving response based on feedback...",
+                "regeneration_completed": "Response improved...",
+                "regeneration_skipped": "Response meets quality standards..."
+            }
+            
+            if step in progress_messages:
+                progress_text = progress_messages[step]
+            else:
+                progress_text = f"Processing ({step})..."
+                
+            assistant_msg.content = f"[{progress_text} {progress}%]"
+            db.session.commit()
+            
+    except Exception as e:
+        print(f"[ERROR] Failed to update progress message: {e}")
+
+
+def update_assistant_message_from_state(state, message_id, output_number):
+    """
+    Update the assistant message with the final results from processing.
+    """
+    try:
+        # Get the current message
+        assistant_msg = AssistantMessage.query.filter_by(
+            message_id=message_id, 
+            output_number=output_number
+        ).first()
+        
+        if not assistant_msg:
+            print(f"[ERROR] Assistant message not found: {message_id}, output_number: {output_number}")
+            return
+            
+        # If there was an error, update with error message
+        if state["status"] == "error" or state["error"]:
+            error_msg = state["error"] or "Unknown error"
+            assistant_msg.content = f"[Error: {error_msg}]"
+            db.session.commit()
+            return
+            
+        # Get final response
+        final_response = state["final_response"]
+        if not final_response:
+            assistant_msg.content = "[Error: No response generated]"
+            db.session.commit()
+            return
+            
+        # Update message content
+        assistant_msg.content = final_response
+        
+        # Update thinking
+        if state["assistant_response"] and "thinking" in state["assistant_response"]:
+            assistant_msg.thinking = state["assistant_response"]["thinking"]
+            
+        # Update search output
+        if state["search_result"]:
+            assistant_msg.search_output = json.dumps(state["search_result"])
+            
+        # Update critic score
+        if state["critic_result"]:
+            assistant_msg.critic_score = json.dumps(state["critic_result"])
+            
+        # Update regenerated content if available
+        if state["regenerated_response"]:
+            assistant_msg.regenerated_content = state["regenerated_response"]
+            
+        # Update regenerated critic if available
+        if state["regenerated_critic"]:
+            assistant_msg.regenerated_critic = json.dumps(state["regenerated_critic"])
+            
+        # Commit changes
+        db.session.commit()
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to update assistant message: {e}")
+        # Try to update with error message
+        try:
+            if assistant_msg:
+                assistant_msg.content = f"[Error updating message: {str(e)}]"
+                db.session.commit()
+        except:
+            pass
